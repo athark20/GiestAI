@@ -9,6 +9,7 @@ google-auth-httplib2>=0.2.0
 requests>=2.31
 python-dotenv>=1.0.1
 apscheduler>=3.10.4
+pytz>=2024.1
 
 # OpenAI + HTTP stack (pin these to avoid the 'proxies' error)
 openai==1.45.0

@@ -1,17 +1,21 @@
-# FastAPI stack
+# Web
 fastapi>=0.110
 uvicorn[standard]>=0.29
 
-# Google + sheets
+# Scheduling & utils
+apscheduler>=3.10.4
+python-dotenv>=1.0.1
+pytz>=2024.1
+tzlocal>=5.2
+requests>=2.31
+python-dateutil>=2.9.0
+
+# Google Sheets
 gspread>=6.0.0
 google-auth>=2.29.0
 google-auth-httplib2>=0.2.0
-requests>=2.31
-python-dotenv>=1.0.1
-apscheduler>=3.10.4
-pytz>=2024.1
 
-# OpenAI + HTTP stack (pin these to avoid the 'proxies' error)
+# OpenAI & HTTP client pins (avoid 'proxies' error)
 openai==1.45.0
 httpx==0.27.2
 httpcore==1.0.5

@@ -350,6 +350,94 @@ def set_status(phone: str, status: str):
         "Last Interaction At": fmt_dt(now_ist()),
     })
 
+# === Client Schedule helpers (ADDED) ===
+def upsert_client_schedule_entry(
+    client_id: str,
+    slot_id: str,
+    date: str,
+    start_time: str,
+    end_time: str,
+    capacity: str,
+    status: str = "scheduled",
+    notes: str = "",
+    event_category: str = "General",
+    pricing: str = "",
+    updated_by: str = "AI",
+):
+    """
+    Create or update a row in Client Schedule for (client_id, slot_id).
+    """
+    try:
+        rows = rows_to_dicts(ws_client_schedule, HEADERS_CLIENT_SCHEDULE)
+        # find existing row
+        for idx, r in enumerate(rows, start=2):  # row 1 is header
+            if r.get("client_id") == client_id and r.get("slot_id") == slot_id:
+                patch = {
+                    "client_id": client_id,
+                    "slot_id": slot_id,
+                    "date": date,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "capacity": capacity,
+                    "status": status,
+                    "notes": notes,
+                    "updated_by": updated_by,
+                    "created_at": r.get("created_at") or fmt_dt(now_ist()),
+                    "event_category": event_category,
+                    "pricing": pricing,
+                }
+                ws_client_schedule.update(
+                    f"A{idx}:{chr(64 + len(HEADERS_CLIENT_SCHEDULE))}{idx}",
+                    [[patch.get(h, "") for h in HEADERS_CLIENT_SCHEDULE]],
+                )
+                logging.info(f"[OPS] Client schedule updated | client_id={client_id}; slot_id={slot_id}")
+                return
+
+        # not found -> append
+        append_row(ws_client_schedule, HEADERS_CLIENT_SCHEDULE, {
+            "client_id": client_id,
+            "slot_id": slot_id,
+            "date": date,
+            "start_time": start_time,
+            "end_time": end_time,
+            "capacity": capacity,
+            "status": status,
+            "notes": notes,
+            "updated_by": updated_by,
+            "created_at": fmt_dt(now_ist()),
+            "event_category": event_category,
+            "pricing": pricing,
+        })
+        logging.info(f"[OPS] Client schedule created | client_id={client_id}; slot_id={slot_id}")
+    except Exception as e:
+        logging.error(f"[ERR] upsert_client_schedule_entry failed: {e}")
+
+def check_schedule_conflict(client_id: str, date: str, start_time: str, end_time: str) -> Optional[Dict[str, str]]:
+    """
+    Return the conflicting schedule row (dict) for the same client/date if time overlaps, else None.
+    """
+    try:
+        rows = rows_to_dicts(ws_client_schedule, HEADERS_CLIENT_SCHEDULE)
+        new_start = dtparser.parse(f"{date} {start_time}")
+        new_end = dtparser.parse(f"{date} {end_time}")
+
+        for r in rows:
+            if r.get("client_id") != client_id or r.get("date") != date:
+                continue
+            try:
+                s = dtparser.parse(f"{r.get('date')} {r.get('start_time')}")
+                e = dtparser.parse(f"{r.get('date')} {r.get('end_time')}")
+                # overlap if latest start < earliest end
+                if max(new_start, s) < min(new_end, e):
+                    return r
+            except Exception:
+                continue
+        return None
+    except Exception as e:
+        logging.error(f"[ERR] check_schedule_conflict failed: {e}")
+        return None
+# === End Client Schedule helpers (ADDED) ===
+
 # ---------------------------
 # Escalation / Bridge helpers
 # ---------------------------

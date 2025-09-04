@@ -5,7 +5,7 @@ import json
 import uuid
 import logging
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import pytz
 from dateutil import parser as dtparser
@@ -17,9 +17,10 @@ if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 # -----------------------------------------------------------------
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -48,8 +49,6 @@ GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
-
-# Managers: comma-separated list like: whatsapp:+14155552671,whatsapp:+91888XXXXXXX
 MANAGER_WHATSAPP_NUMBERS = set(
     [n.strip() for n in os.getenv("MANAGER_WHATSAPP_NUMBERS", "").split(",") if n.strip()]
 )
@@ -82,6 +81,9 @@ ws_client_schedule = _ss.worksheet("Client Schedule")
 ws_conversation_log = _ss.worksheet("Conversation Log")
 ws_analytics = _ss.worksheet("Analytics Data")
 
+# NEW: Escalations sheet (create this sheet once in your Google Sheet)
+ws_escalations = _ss.worksheet("Escalations")
+
 # Expected headers for robust CRUD
 HEADERS_EVENT_ENTRY = [
     "Name", "Phone Number", "Event", "Status", "Event Date", "Feedback", "Rating",
@@ -102,6 +104,11 @@ HEADERS_CONVERSATION_LOG = [
 HEADERS_ANALYTICS = [
     "metric_type", "metric_value", "date", "time_period", "additional_context", "calculated_at"
 ]
+# NEW: Escalations headers
+HEADERS_ESCALATIONS = [
+    "timestamp", "from_phone", "user_message", "ai_intent", "ai_confidence",
+    "reason", "notified_managers", "notes"
+]
 
 def _ensure_headers(ws, expected: List[str]):
     """Ensure sheet has the expected header row exactly in row 1."""
@@ -119,10 +126,12 @@ _ensure_headers(ws_event_data, HEADERS_EVENT_DATA)
 _ensure_headers(ws_client_schedule, HEADERS_CLIENT_SCHEDULE)
 _ensure_headers(ws_conversation_log, HEADERS_CONVERSATION_LOG)
 _ensure_headers(ws_analytics, HEADERS_ANALYTICS)
+_ensure_headers(ws_escalations, HEADERS_ESCALATIONS)  # NEW
 
 # --------------
 # Util functions
 # --------------
+
 def now_ist() -> datetime:
     return datetime.now(IST)
 
@@ -133,6 +142,7 @@ def rows_to_dicts(ws, headers: List[str]) -> List[Dict[str, str]]:
     values = ws.get_all_values()
     if not values:
         return []
+    # ensure first row == headers
     if values[0] != headers:
         cols = min(len(values[0]), len(headers))
         values[0] = headers[:cols]
@@ -160,71 +170,64 @@ def update_first_match(ws, headers: List[str], match_fn, patch: Dict[str, str]) 
     return False
 
 # ---------------------------
-# Twilio helpers
+# Twilio send helper
 # ---------------------------
-def _log_twilio_request_response(resp):
-    try:
-        # Twilio client logs requests via INFO, this is extra clarity for your ops log
-        logging.info(f"Response Status Code: {resp.status_code}")
-        logging.info(f"Response Headers: {dict(resp.headers)}")
-    except Exception:
-        pass
+
+def normalize_whatsapp_number(n: str) -> str:
+    if not n:
+        return ""
+    n = n.strip()
+    if n.startswith("whatsapp:"):
+        return n
+    if n.startswith("+"):
+        return f"whatsapp:{n}"
+    return f"whatsapp:+{n}"
+
+def get_valid_manager_numbers() -> List[str]:
+    nums: List[str] = []
+    for raw in MANAGER_WHATSAPP_NUMBERS:
+        norm = normalize_whatsapp_number(raw)
+        if norm and norm.lower() != "whatsapp:+91yyyyyyyyyy":
+            nums.append(norm)
+    return nums
 
 def send_whatsapp(to_whatsapp: str, body: str):
-    """Send WhatsApp with robust logging; expects `to_whatsapp` like 'whatsapp:+1415...'."""
+    """
+    Send WhatsApp via Twilio with strong logging around request/response.
+    Raises exception if Twilio returns non-2xx.
+    """
     try:
-        # Twilio's python lib doesn't expose request headers easily; we add our own envelope logs.
         logging.info("-- BEGIN Twilio API Request --")
-        logging.info(f"POST Request: https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json")
-        logging.info("Headers:")
-        logging.info("Content-Type : application/x-www-form-urlencoded")
-        logging.info("Accept : application/json")
-        logging.info(f"User-Agent : twilio-python")
-        logging.info("X-Twilio-Client : python")
-        logging.info("Accept-Charset : utf-8")
-        logging.info("-- END Twilio API Request --")
-
+        logging.info(f"Sending WhatsApp | to={to_whatsapp}")
         msg = _twilio_client.messages.create(
             from_=TWILIO_WHATSAPP_FROM,
             to=to_whatsapp,
             body=body,
         )
-        # The Twilio client returns a Message instance; a low-level Response isn't directly returned,
-        # but we still log the created status via the resource
-        logging.info(f"[OPS] Twilio message created | sid={msg.sid} | to={to_whatsapp}")
+        logging.info(f"Twilio message SID={msg.sid} | status={msg.status}")
     except Exception as e:
         logging.error(f"Twilio send error to {to_whatsapp}: {e}")
-        logging.info(f"[OPS] Twilio send failed | to={to_whatsapp}; err={e}")
+        raise
 
-def get_valid_manager_numbers() -> List[str]:
-    """Return manager numbers guaranteed in 'whatsapp:+E164' format; log about invalid ones."""
-    good = []
-    bad = []
-    for n in MANAGER_WHATSAPP_NUMBERS:
-        s = n.strip()
-        if s.startswith("whatsapp:+") and len(s) > len("whatsapp:+"):
-            good.append(s)
-        elif s.startswith("+"):
-            # auto-fix to whatsapp:+
-            fixed = "whatsapp:" + s
-            logging.warning(f"[OPS] Normalized manager number to WhatsApp format: {s} -> {fixed}")
-            good.append(fixed)
-        else:
-            bad.append(s)
-    if bad:
-        logging.warning(f"[OPS] Some manager numbers are invalid and will be ignored: {bad} | expected format 'whatsapp:+E164'")
-    if not good:
-        logging.warning("[OPS] No valid manager numbers found; escalation messages will be skipped.")
-    return good
-
-def notify_managers(text: str):
+def notify_managers(text: str) -> bool:
+    """Try to notify all configured managers. Returns True if at least one send succeeds."""
     nums = get_valid_manager_numbers()
+    any_sent = False
+    if not nums:
+        logging.warning("[OPS] No valid manager numbers to notify.")
+        return False
     for n in nums:
-        send_whatsapp(n, text)
+        try:
+            send_whatsapp(n, text)
+            any_sent = True
+        except Exception as e:
+            logging.error(f"[OPS] Manager notify failed | to={n} | err={e}")
+    return any_sent
 
 # ---------------------------
 # AI: prompt templates & call
 # ---------------------------
+
 FORMAT_INSTRUCTIONS = (
     "Respond ONLY with valid JSON using keys: "
     "['reply_text','intent','slots','register','selected_event_id','escalate','confidence'] "
@@ -234,31 +237,30 @@ FORMAT_INSTRUCTIONS = (
 
 GUEST_SYSTEM = (
     "You are a friendly and professional event concierge AI assistant.\n"
-    "CONTEXT: You help guests discover and register for upcoming events. You can also answer general event questions "
-    "(dress code, parking, agenda, speakers, timing, venue directions) based on the context provided. "
-    "If the question cannot be reasonably answered from the provided event context, say so briefly and set escalate=true.\n\n"
+    "CONTEXT: You help guests discover and register for upcoming events. Always maintain a conversational, helpful tone.\n\n"
     "CONVERSATION FLOW:\n"
     "1) Warm welcome (if first time) or personalized greeting\n"
-    "2) Present upcoming events with details (name, date, start/end time, venue, description)\n"
+    "2) Present upcoming events with full details (name, date, start/end time, venue, description)\n"
     "3) Help user select preferred event\n"
     "4) Confirm registration details\n"
     "5) Complete registration process\n"
     "6) Provide event confirmation and next steps\n\n"
+    "Also support free-form questions about events. If the data isn't available in CURRENT EVENTS, set escalate=true.\n\n"
     "RESPONSE RULES:\n"
     "- Keep responses conversational and natural\n"
-    "- Include event details when relevant\n"
-    "- Answer general questions when possible from context\n"
-    "- If insufficient information, set escalate=true and provide a short apology\n"
-    "- Confirm details before final registration\n"
+    "- Always include event details (date, time, venue) when relevant\n"
+    "- Ask follow-up questions to understand preferences\n"
+    "- Confirm all details before final registration\n"
     "- Offer alternatives if preferred event is full\n\n"
     + FORMAT_INSTRUCTIONS
 )
 
 CLIENT_SYSTEM = (
     "You are a professional event management AI assistant for clients and influencers.\n"
-    "CLIENT FLOW: If the user wants to host, collect details (client name/contact, event name/purpose, date/time, venue, capacity, special needs). "
-    "Confirm and then create the event. If influencer, present available events for promotion and collect preferences.\n"
-    "Also answer general management questions based on given context; otherwise set escalate=true.\n\n"
+    "CLIENT FLOW: Identify if the user is a CLIENT (hosting) or INFLUENCER (promotion partner).\n"
+    "For CLIENTS: Collect details (client name/contact, event name/purpose, date/time, venue reqs, capacity, special needs). Confirm and create event.\n"
+    "For INFLUENCERS: Present promotable events; gather influencer details and preferences.\n"
+    "Support free-form queries. If required info is missing, set escalate=true.\n\n"
     + FORMAT_INSTRUCTIONS
 )
 
@@ -280,6 +282,7 @@ def call_ai(system_prompt: str, user_prompt: str) -> Dict:
             ],
         )
         content = completion.choices[0].message.content.strip()
+        parsed = None
         try:
             parsed = json.loads(content)
         except Exception:
@@ -319,6 +322,7 @@ def call_ai(system_prompt: str, user_prompt: str) -> Dict:
 # ---------------------------
 # Domain helpers (Sheets CRUD)
 # ---------------------------
+
 def get_upcoming_events() -> List[Dict[str, str]]:
     rows = rows_to_dicts(ws_event_data, HEADERS_EVENT_DATA)
     out = []
@@ -454,67 +458,83 @@ def set_status(phone: str, status: str):
         "Last Interaction At": fmt_dt(now_ist()),
     })
 
+# NEW: escalation logging & follow-up helpers
+def log_escalation(from_phone: str, user_message: str, ai_intent: str, ai_conf: float,
+                   reason: str, notified: bool, notes: str = ""):
+    append_row(ws_escalations, HEADERS_ESCALATIONS, {
+        "timestamp": fmt_dt(now_ist()),
+        "from_phone": from_phone,
+        "user_message": user_message,
+        "ai_intent": ai_intent,
+        "ai_confidence": f"{ai_conf:.2f}",
+        "reason": reason,
+        "notified_managers": "yes" if notified else "no",
+        "notes": notes,
+    })
+
+def mark_followup_required(phone: str, yes_no: str = "yes"):
+    def _match(d):
+        return d.get("Phone Number") == phone
+    update_first_match(ws_event_entry, HEADERS_EVENT_ENTRY, _match, {
+        "Follow Up Required": yes_no,
+        "Last Interaction At": fmt_dt(now_ist()),
+    })
+
 # ---------------------------
 # Text templates
 # ---------------------------
-EVENT_LINE = (
-    "• {event_name} (ID: {event_id})\n"
-    "  📅 {date} | ⏰ {start_time}-{end_time}\n"
-    "  📍 {venue}\n"
-    "  🎟️ Spots left: {spots}\n"
-    "  🔗 {link}\n"
-)
-
-WELCOME_MENU = (
-    "👋 Hey there! I’m your Event Concierge.\n\n"
-    "Please choose an option:\n"
-    "1️⃣ Register for an upcoming event\n"
-    "2️⃣ Host / Create an event\n\n"
-    "💡 You can also ask questions like:\n"
-    "• “What’s the dress code for Launch Night?”\n"
-    "• “Where’s the venue?”\n"
-    "• “Who are the speakers?”\n"
-    "• “Parking details?”\n\n"
-    "Reply with 1 or 2 (or ask your question)."
-)
 
 WELCOME_TEMPLATE = (
-    "Hi {name}! Here are upcoming events you might like:\n\n"
+    "👋 *Welcome!* I'm your event concierge.\n\n"
+    "Here are upcoming events you might like:\n\n"
     "{events}\n"
-    "👉 Reply with the Event ID to book, or ask me anything about the events."
+    "Reply with the *Event ID* to register, or ask me *any question* about the events.\n\n"
+    "🧭 *Menu*\n"
+    "1️⃣ Register for upcoming events\n"
+    "2️⃣ Host an event (for clients)\n"
+    "3️⃣ Talk to a human manager"
+)
+
+EVENT_LINE = (
+    "• *{event_name}* _(ID: {event_id})_\n"
+    "  📅 {date} | ⏰ {start_time}–{end_time}\n"
+    "  📍 {venue}\n"
+    "  🎟️ Spots left: {spots}\n"
+    "  🔗 {link}\n\n"
 )
 
 CONFIRM_REG_TEMPLATE = (
-    "✅ You’re booked for **{event_name}**\n"
-    "📅 {date} | ⏰ {start}-{end}\n"
+    "✅ *Booking Confirmed!*\n\n"
+    "*{event_name}*\n"
+    "📅 {date}\n"
+    "⏰ {start}–{end}\n"
     "📍 {venue}\n\n"
-    "We’ll send reminders here. Anything else I can help with?"
+    "You'll receive reminders and updates here. Anything else I can help with?"
 )
 
 FULL_TEMPLATE = (
-    "⚠️ That event seems full right now.\n"
-    "Would you like to be waitlisted or see alternatives?"
+    "😞 That event is currently *full*.\n"
+    "Would you like me to *waitlist* you or suggest *alternatives*?"
 )
 
 FEEDBACK_ASK_TEMPLATE = (
-    "🙏 Hope you enjoyed the event!\n"
-    "Could you share a quick rating (1-5 ⭐) and any comments?"
+    "🙏 Hope you enjoyed the event! We'd love your feedback — how was your experience (1–5 ⭐) and any comments?"
 )
 
 EVENT_DAY_CHECKIN = (
-    "⏰ Today’s the day!\n"
-    "Are you joining **{event_name}** at {start_time}?\n"
-    "Reply YES to confirm, NO to decline."
+    "🔔 *Reminder* — Are you joining *{event_name}* at *{start_time}* today?\n"
+    "Reply *YES* to confirm, *NO* to decline."
 )
 
 DECLINED_TEMPLATE = (
-    "Got it — I’ve marked you as not attending.\n"
+    "👍 All set — I’ve marked you as *not attending*.\n"
     "If you want to pick another event, just say *show events*."
 )
 
 # ---------------------------
 # FastAPI app & endpoints
 # ---------------------------
+
 app = FastAPI(title="WhatsApp Concierge AI")
 
 class TwilioInbound(BaseModel):
@@ -535,8 +555,6 @@ class TwilioInbound(BaseModel):
     FromZip: Optional[str] = None
     WaId: Optional[str] = None
 
-GREETINGS = {"hi", "hello", "hey", "yo", "hola", "hii", "hlo", "hlw"}
-
 @app.post("/twilio/whatsapp")
 async def twilio_whatsapp(request: Request):
     form = await request.form()
@@ -544,11 +562,10 @@ async def twilio_whatsapp(request: Request):
 
     from_num = data.From or ""
     body = (data.Body or "").strip()
-    lowered = body.lower()
     who = "guest"
 
     # Manager override via hashtag or allowed number
-    if lowered.startswith("#manager") or from_num in MANAGER_WHATSAPP_NUMBERS:
+    if body.lower().startswith("#manager") or from_num in MANAGER_WHATSAPP_NUMBERS:
         who = "manager"
 
     # Build user conversation history
@@ -570,86 +587,18 @@ async def twilio_whatsapp(request: Request):
             spots=r.get("Available Spots",""),
             link=r.get("Map/Link",""),
         )
-    events_str = "\n".join([_fmt_event(e) for e in events]) or "(No upcoming events listed)"
+    events_str = "".join([_fmt_event(e) for e in events]) or "_(No upcoming events listed)_\n"
 
-    # Ensure guest existence
-    if who == "guest":
-        ensure_guest_entry(from_num)
-
-    state_before = history[-1].get("state_after") if history else "none"
-
-    # ---------- Friendly greeting pre-check ----------
-    if who == "guest":
-        if lowered in GREETINGS or lowered.startswith(("hi ", "hello ")):
-            reply_text = WELCOME_MENU
-            state_after = "welcome_sent"
-            intent = "greeting"
-            log_conversation(
-                conversation_id=f"{from_num}_guest",
-                who="guest",
-                phone_or_client_id=from_num,
-                intent=intent,
-                message_in=body,
-                reply_out=reply_text,
-                state_before=state_before or "none",
-                state_after=state_after or "none",
-                ai_confidence=0.99,
-                escalation_flag="no",
-            )
-            resp = MessagingResponse()
-            resp.message(reply_text)
-            return PlainTextResponse(str(resp), media_type="application/xml")
-
-        # Quick numeric menu handling (1 = register, 2 = host)
-        if lowered in {"1", "2"}:
-            if lowered == "1":
-                # Show events directly
-                rendered = WELCOME_TEMPLATE.format(name="there", events=events_str)
-                reply_text = rendered + "\n\n👉 *Reply with the Event ID* to book."
-                state_after = "awaiting_event_choice"
-            else:
-                reply_text = (
-                    "Great! Let’s host your event.\n"
-                    "Please share:\n"
-                    "• Your name & contact\n"
-                    "• Event name & purpose\n"
-                    "• Preferred date/time\n"
-                    "• Venue requirements\n"
-                    "• Capacity & any special needs"
-                )
-                state_after = "client_intro"
-            log_conversation(
-                conversation_id=f"{from_num}_guest",
-                who="guest",
-                phone_or_client_id=from_num,
-                intent="menu_select",
-                message_in=body,
-                reply_out=reply_text,
-                state_before=state_before or "none",
-                state_after=state_after or "none",
-                ai_confidence=0.99,
-                escalation_flag="no",
-            )
-            resp = MessagingResponse()
-            resp.message(reply_text)
-            return PlainTextResponse(str(resp), media_type="application/xml")
-
-    # Decide flow for AI
+    # Decide flow
     if who == "manager":
         analytics_summary = compute_analytics_summary_text()
         system = MANAGER_SYSTEM
         user_prompt = f"Provide an executive summary for the following data and return JSON as instructed.\nDATA:\n{analytics_summary}"
     else:
-        # If the user mentions client/host keywords, switch to client flow
-        if any(k in lowered for k in ["client", "influencer", "host", "hosting", "partner", "create event", "organise", "organize"]):
-            who = "client"
-            system = CLIENT_SYSTEM
-            user_prompt = (
-                f"CURRENT EVENTS (for reference):\n{events_str}\n\n"
-                f"USER HISTORY:\n{history_str}\n\n"
-                f"USER MESSAGE:\n{body}"
-            )
-        else:
+        lower = body.lower()
+
+        # Menu shortcuts to keep your UX
+        if lower in ("1", "register", "register event", "book", "book event", "upcoming", "show events"):
             who = "guest"
             system = GUEST_SYSTEM
             user_prompt = (
@@ -657,22 +606,89 @@ async def twilio_whatsapp(request: Request):
                 f"USER HISTORY:\n{history_str}\n\n"
                 f"USER MESSAGE:\n{body}"
             )
+        elif lower in ("2", "host", "hosting", "client", "create event"):
+            who = "client"
+            system = CLIENT_SYSTEM
+            user_prompt = (
+                f"CURRENT EVENTS (for reference):\n{events_str}\n\n"
+                f"USER HISTORY:\n{history_str}\n\n"
+                f"USER MESSAGE:\n{body}"
+            )
+        elif lower in ("3", "human", "manager", "escalate"):
+            # force escalation
+            ai = {
+                "reply_text": "Connecting you with a human manager…",
+                "intent": "escalate",
+                "slots": {},
+                "register": False,
+                "selected_event_id": None,
+                "escalate": True,
+                "confidence": 1.0,
+            }
+            system = None
+            user_prompt = None
+        else:
+            # Free-form by default → guest Q&A about events
+            who = "guest"
+            system = GUEST_SYSTEM
+            user_prompt = (
+                f"CURRENT EVENTS:\n{events_str}\n\n"
+                f"USER HISTORY:\n{history_str}\n\n"
+                f"USER MESSAGE:\n{body}\n\n"
+                f"Note: If details requested are not available in CURRENT EVENTS, set escalate=true."
+            )
 
-    ai = call_ai(system, user_prompt)
-    reply_text = ai.get("reply_text", "")[:1500]  # WhatsApp safe length
+    if system:
+        ai = call_ai(system, user_prompt)
+
+    reply_text = ai.get("reply_text", "")[:1500]  # whatsapp safe length
     intent = ai.get("intent", "unknown")
     slots = ai.get("slots", {}) or {}
     selected_event_id = ai.get("selected_event_id")
     register = bool(ai.get("register"))
-    # ---- Safer escalation: only if the model explicitly sets it ----
     escalate = bool(ai.get("escalate"))
     confidence = float(ai.get("confidence") or 0.6)
 
+    state_before = history[-1].get("state_after") if history else "none"
     state_after = state_before
 
-    # Guest flow
+    # Ensure guest existence
     if who == "guest":
-        # If user typed an Event ID directly
+        ensure_guest_entry(from_num)
+
+    # Handle escalation uniformly (AI or user forced)
+    if escalate:
+        notify_text = (
+            f"[ALERT] Guest needs help\n"
+            f"From: {from_num}\n"
+            f"Msg: {body}\n"
+            f"AI_intent: {intent} | conf={confidence}"
+        )
+        notified = notify_managers(notify_text)
+        log_escalation(
+            from_phone=from_num,
+            user_message=body,
+            ai_intent=intent,
+            ai_conf=confidence,
+            reason="AI set escalate=true (insufficient context or special request)",
+            notified=notified,
+            notes="Triggered from WhatsApp flow",
+        )
+        if not notified:
+            mark_followup_required(from_num, "yes")
+            reply_tail = (
+                "\n\n👨‍💼 I tried to reach a human manager, but the notification didn’t go through. "
+                "I’ve flagged this for manual follow-up. Someone will reach out to you shortly."
+            )
+        else:
+            reply_tail = "\n\n👨‍💼 I’ve looped in a human manager to assist you further. They’ll reply here shortly."
+
+        reply_text = f"{reply_text}{reply_tail}" if reply_text else reply_tail
+        state_after = "escalated"
+
+    # Intent handling (non-escalation)
+    elif who == "guest":
+        # Quick path: if user typed an exact Event ID
         if not selected_event_id and body.upper().startswith("EVT-"):
             selected_event_id = body.upper().split()[0]
             register = True
@@ -681,7 +697,13 @@ async def twilio_whatsapp(request: Request):
         if intent == "register" and selected_event_id:
             evt = find_event_by_id(selected_event_id)
             if not evt:
-                reply_text = "I couldn't find that Event ID. Please double-check or say *show events*."
+                reply_text = (
+                    "❌ I couldn't find that *Event ID*. Please double-check or say *show events*.\n\n"
+                    "🧭 *Menu*\n"
+                    "1️⃣ Register for upcoming events\n"
+                    "2️⃣ Host an event (for clients)\n"
+                    "3️⃣ Talk to a human manager"
+                )
                 state_after = "awaiting_event_choice"
             else:
                 try:
@@ -692,7 +714,7 @@ async def twilio_whatsapp(request: Request):
                     reply_text = FULL_TEMPLATE
                     state_after = "full_offer_alternatives"
                 else:
-                    name = slots.get("name") or "Guest"
+                    name = slots.get("name") or infer_name_from_history(history) or "Guest"
                     if dec_available_spots(selected_event_id):
                         update_guest_registration(
                             phone=from_num,
@@ -719,13 +741,13 @@ async def twilio_whatsapp(request: Request):
         else:
             if not history:
                 rendered = WELCOME_TEMPLATE.format(name="there", events=events_str)
-                reply_text = rendered + "\n\n👉 *Reply with the Event ID* to book or ask any question."
+                reply_text = rendered
                 state_after = "welcome_sent"
             else:
-                # keep AI reply; if it couldn't answer and asked to escalate, we’ll handle below
+                # Keep AI reply but append mini menu for easy navigation
+                reply_text = f"{reply_text}\n\n🧭 *Menu*\n1️⃣ Register for upcoming events\n2️⃣ Host an event (for clients)\n3️⃣ Talk to a human manager"
                 state_after = intent or "chit_chat"
 
-    # Client flow
     elif who == "client":
         if intent in ("create_event", "host_event", "register_event"):
             event_id = f"EVT-{uuid.uuid4().hex[:6].upper()}"
@@ -766,34 +788,22 @@ async def twilio_whatsapp(request: Request):
                 "pricing": slots.get("pricing") or "",
             })
             reply_text = (
-                f"✅ Your event **{slots.get('event_name','Untitled Experience')}** was created.\n"
-                f"🆔 ID: {event_id}\n"
-                f"📅 {evt_date} | ⏰ {start_t}-{end_t}\n"
-                f"📍 {venue}\n\n"
-                "I’ll keep you updated."
+                "🧾 *Event Created!*\n\n"
+                f"🆔 {event_id}\n"
+                f"🗓️ {evt_date}  ⏰ {start_t}–{end_t}\n"
+                f"📍 {venue}\n"
+                f"🎟️ Capacity: {cap}\n\n"
+                "I’ll keep you updated here. Share more details anytime."
             )
             state_after = "client_event_created"
         else:
+            reply_text = f"{reply_text}\n\n🧭 *Menu*\n1️⃣ Register for upcoming events\n2️⃣ Host an event (for clients)\n3️⃣ Talk to a human manager"
             state_after = intent or "client_chat"
 
-    # Manager flow: nothing extra here; reply already prepared
     elif who == "manager":
         state_after = "manager_query"
 
-    # ---- Escalation (only when explicit) ----
-    if escalate:
-        notify_text = f"[ALERT] Guest needs help\nFrom: {from_num}\nMsg: {body}\nAI_conf: {confidence}"
-        notify_managers(notify_text)
-        logging.info(f"[OPS] Escalated to manager | phone={from_num}; user_msg={body}")
-        # Add a user-facing line (polite and clear)
-        reply_text = (
-            f"{reply_text}\n\n"
-            "👨‍💼 I’ve looped in a human manager to assist you further. They’ll reply here shortly."
-            if reply_text else
-            "👨‍💼 I’ve looped in a human manager to assist you further. They’ll reply here shortly."
-        )
-
-    # Log
+    # Log conversation
     log_conversation(
         conversation_id=f"{from_num}_{who}",
         who=who,
@@ -815,6 +825,7 @@ async def twilio_whatsapp(request: Request):
 # ---------------------------
 # Analytics
 # ---------------------------
+
 def compute_analytics_summary_text() -> str:
     entries = rows_to_dicts(ws_event_entry, HEADERS_EVENT_ENTRY)
     logs = rows_to_dicts(ws_conversation_log, HEADERS_CONVERSATION_LOG)
@@ -856,6 +867,7 @@ async def analytics_summary():
 # ---------------------------
 # Drip & Reminders Engine
 # ---------------------------
+
 def infer_name_from_history(history: List[Dict[str,str]]) -> str:
     return ""
 
@@ -903,7 +915,7 @@ def process_drips_and_feedback():
 
             build_due = should_send_build_up(now, evt_date, last_intent)
             if build_due:
-                send_whatsapp(phone, f"⏳ Countdown: {evt.get('Event Name')} is on {evt.get('Event Date')}! Need any help?")
+                send_whatsapp(phone, f"⏳ *Countdown* — {evt.get('Event Name')} is coming up on {evt.get('Event Date')}! Need any help?")
                 def _m(d):
                     return d.get("Phone Number") == phone
                 update_first_match(ws_event_entry, HEADERS_EVENT_ENTRY, _m, {
@@ -925,7 +937,7 @@ def process_drips_and_feedback():
 
             mid_dt = start_dt + (end_dt - start_dt) / 2
             if start_dt <= now <= end_dt and last_intent != "in_event_experience":
-                send_whatsapp(phone, f"👋 How's **{evt.get('Event Name')}** going so far? Need anything?")
+                send_whatsapp(phone, f"👋 How's *{evt.get('Event Name')}* going so far? Any assistance needed?")
                 def _m(d):
                     return d.get("Phone Number") == phone
                 update_first_match(ws_event_entry, HEADERS_EVENT_ENTRY, _m, {
@@ -949,6 +961,7 @@ def process_drips_and_feedback():
 # ---------------------------
 # Scheduler setup
 # ---------------------------
+
 scheduler = BackgroundScheduler(timezone=TZ_NAME)
 scheduler.add_job(process_drips_and_feedback, CronTrigger.from_crontab("*/5 * * * *"))
 scheduler.start()
@@ -956,6 +969,7 @@ scheduler.start()
 # ---------------------------
 # Root & health
 # ---------------------------
+
 @app.get("/")
 async def root():
     return {"ok": True, "service": "WhatsApp Concierge AI", "time": fmt_dt(now_ist())}
@@ -963,7 +977,17 @@ async def root():
 # ---------------------------
 # Optional: Twilio test sender
 # ---------------------------
+
 @app.post("/dev/send-test")
 async def dev_send_test(to: str, text: str):
-    send_whatsapp(to, text)
-    return {"sent": True}
+    to_whatsapp = normalize_whatsapp_number(to)
+    try:
+        send_whatsapp(to_whatsapp, text)
+        return {"sent": True}
+    except Exception as e:
+        logging.info(f"[OPS] Twilio send failed | to={to_whatsapp}; err={e}")
+        return {"sent": False, "error": str(e)}
+
+# ---------------------------
+# Run via: uvicorn main:app --reload
+# ---------------------------

@@ -259,7 +259,7 @@ def send_whatsapp(to_whatsapp: str, body: str):
     try:
         _twilio_client.messages.create(
             from_=TWILIO_WHATSAPP_FROM,
-            to=to=to_whatsapp,
+            to=to_whatsapp,
             body=body,
         )
     except Exception as e:
